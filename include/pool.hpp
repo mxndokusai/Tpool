@@ -17,6 +17,60 @@
 #include <variant>
 #include <vector>
 
+/*
+ * Note:
+ * Rigtorp's mpmc requires all types to be nothrow constructible for lock-free
+ * guarantees. However, the task/std::function<void()> is not nothrow
+ * constructible. It can throw during construction/move as it may allocate
+ * memory. Therefore we define a nothrow_task wrapper that makes any callable
+ * nothrow constructible/movable. It uses unique_ptr for type-erasure with
+ * nothrow guarantee. Another solution would be to relax requirements by
+ * removing nothrow assertions, but this loses lock-free guarantees and could
+ * corrupt the queue if exception is thrown during construction.
+ */
+class nothrow_task {
+public:
+  nothrow_task() noexcept = default;
+
+  template <typename F>
+  nothrow_task(F &&f) noexcept
+      : impl_(std::make_unique<impl<F>>(std::forward<F>(f))) {}
+
+  nothrow_task(nothrow_task &&) noexcept = default;
+  nothrow_task &operator=(nothrow_task &&) noexcept = default;
+
+  nothrow_task(const nothrow_task &) = delete;
+  nothrow_task &operator=(const nothrow_task &) = delete;
+
+  void operator()() const {
+    if (impl_) {
+      impl_->call();
+    }
+  }
+
+  explicit operator bool() const noexcept { return impl_ != nullptr; }
+
+private:
+  struct impl_base {
+    virtual ~impl_base() = default;
+    virtual void call() = 0;
+  };
+
+  template <typename F> struct impl : impl_base {
+    F func;
+
+    explicit impl(F &&f) : func(std::forward<F>(f)) {}
+
+    void call() override { func(); }
+  };
+
+  std::unique_ptr<impl_base> impl_;
+};
+
+// Verify nothrow properties.
+static_assert(std::is_nothrow_move_constructible_v<nothrow_task>);
+static_assert(std::is_nothrow_move_assignable_v<nothrow_task>);
+
 template <typename T> class task;
 
 template <typename T> struct task_promise {
@@ -232,7 +286,8 @@ public:
     work_count_.fetch_add(1, std::memory_order_release);
 
     // Try emplace for non-blocking insertion into mpmc.
-    bool success = work_queue_.try_emplace(std::forward<Fn>(fn));
+    // Wrap in nothrow_task for lockfree mpmc compatibility.
+    bool success = work_queue_.try_emplace(nothrow_task(std::forward<Fn>(fn)));
 
     if (success) {
       work_available_.release();
@@ -252,7 +307,8 @@ public:
     work_count_.fetch_add(1, std::memory_order_release);
 
     // Use emplace which blocks until space is available.
-    work_queue_.emplace(std::forward<Fn>(fn));
+    // Wrap in nothrow_task for lockfree mpmc compatibility.
+    work_queue_.emplace(nothrow_task(std::forward<Fn>(fn)));
     work_available_.release();
   }
 
@@ -340,7 +396,8 @@ private:
         break;
       }
 
-      std::function<void()> task;
+      // Use a nothrow_task instead of std::function<void()>.
+      nothrow_task task;
 
       // Use try_pop for non-blocking dequeue.
       if (work_queue_.try_pop(task)) {
@@ -361,7 +418,7 @@ private:
   }
 
   std::vector<std::jthread> workers_;
-  mpmc<std::function<void()>> work_queue_;
+  mpmc<nothrow_task> work_queue_;
   std::counting_semaphore<> work_available_{0};
   std::atomic<size_t> work_count_;
   std::atomic<bool> stop_requested_;
